@@ -29,7 +29,7 @@ STATE_PATH = "state.json"
 SEEN_MAX   = 8000
 
 # =========================
-# Filters (핵심 정책)
+# Filters (정책)
 # =========================
 # 1) 보고서명: 유상/무상/유무상 "결정"만 대상으로
 INC_REPORT = re.compile(
@@ -55,7 +55,7 @@ VIEW_URL = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo={}"
 TG_SEND  = "https://api.telegram.org/bot{}/sendMessage"
 
 S = requests.Session()
-S.headers.update({"User-Agent": "dart-alert-github-actions/2.0"})
+S.headers.update({"User-Agent": "dart-alert-github-actions/2.1"})
 
 TG_MAX = 4096
 
@@ -245,6 +245,90 @@ def classify_allocation(doc_text: str) -> str:
     return "N/A"
 
 # =========================
+# 청약일정 추출 (원문 기반)
+# =========================
+def _normalize_ws(s: str) -> str:
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
+def extract_subscription_schedule(doc_text: str) -> str:
+    """
+    원문 텍스트에서 청약 관련 라인을 여러 개 수집해서 한 줄로 합침.
+    - 우리사주/구주주/일반공모 등 라벨이 있으면 그 라벨 우선
+    - 없으면 '청약일' 라인이라도 수집
+    """
+    if not doc_text:
+        return "N/A"
+
+    # 라벨 후보 (우선순위)
+    labels = [
+        "우리사주조합 청약일", "우리사주조합청약일",
+        "구주주 청약일", "구주주청약일",
+        "일반공모 청약일", "일반공모청약일",
+        "일반청약일", "청약일",
+    ]
+
+    lines = [ln.strip() for ln in doc_text.splitlines() if ln.strip()]
+    hits = []
+
+    # 1) 라벨 기반 수집
+    for ln in lines:
+        for lb in labels:
+            if lb in ln:
+                after = ln.split(lb, 1)[1]
+                after = re.sub(r"^[\s:\-·•\)]+", "", after).strip()
+                after = _normalize_ws(after)
+
+                # 값이 비면 다음 라인 붙이기(표 분리 대비)
+                if len(after) < 2:
+                    # 다음 줄 1개만 붙이기(과도 결합 방지)
+                    idx = None
+                    try:
+                        idx = lines.index(ln)
+                    except Exception:
+                        idx = None
+                    if idx is not None and idx + 1 < len(lines):
+                        nxt = _normalize_ws(lines[idx + 1])
+                        if nxt and lb not in nxt:
+                            after = (after + " " + nxt).strip()
+
+                if after:
+                    hits.append(f"{lb}: {after}")
+
+    # 2) 라벨이 전혀 없으면, '청약' 키워드 라인 중 날짜 패턴이 있는 것 수집
+    if not hits:
+        date_pat = re.compile(
+            r"(\d{4}\s*[.\-/년]\s*\d{1,2}\s*[.\-/월]\s*\d{1,2}\s*일?)"
+            r"(\s*[~\-]\s*)?"
+            r"(\d{4}\s*[.\-/년]\s*\d{1,2}\s*[.\-/월]\s*\d{1,2}\s*일?)?",
+            re.I
+        )
+        for ln in lines:
+            if "청약" in ln:
+                m = date_pat.search(ln)
+                if m:
+                    hits.append(_normalize_ws(ln))
+
+    # 중복 제거(순서 유지)
+    uniq = []
+    seen = set()
+    for h in hits:
+        key = re.sub(r"\s+", " ", h)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(h)
+
+    if not uniq:
+        return "N/A"
+
+    # 너무 길면 적당히 자르기
+    out = " / ".join(uniq)
+    if len(out) > 350:
+        out = out[:350] + "…"
+    return out
+
+# =========================
 # main
 # =========================
 def main():
@@ -289,6 +373,9 @@ def main():
             mark_seen(st, rno)
             continue
 
+        # ✅ 청약일정 추출
+        subs = extract_subscription_schedule(doc_text)
+
         ev_type = classify_event_type(rpt_nm)
 
         corp = (it.get("corp_name") or "N/A").strip()
@@ -302,6 +389,7 @@ def main():
             f"• 유형: <b>{html.escape(ev_type)}</b> / 배정: <b>{html.escape(alloc)}</b>",
             f"• 접수일: {html.escape(rcept_dt or 'N/A')}",
             f"• 공시명: {html.escape(rpt_nm)}",
+            f"• 청약일정: {html.escape(subs)}",
         ]
 
         tg_send_safe("\n".join(lines), button_url=url)
