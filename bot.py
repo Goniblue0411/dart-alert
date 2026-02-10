@@ -41,9 +41,7 @@ INC_REPORT = re.compile(
 EXC_3RD = re.compile(r"(제\s*3\s*자\s*배정|제3자배정)", re.I)
 
 # 3) 원문에서 허용되는 배정 방식
-# - 일반주주배정
 ALLOW_GENERAL = re.compile(r"(일반\s*주주\s*배정|일반주주배정)", re.I)
-# - 주주배정(구주주 포함)
 ALLOW_SHAREHOLDER = re.compile(r"(주주\s*배정|주주배정|구주주\s*청약|구주주청약|구주주)", re.I)
 
 # =========================
@@ -55,7 +53,7 @@ VIEW_URL = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo={}"
 TG_SEND  = "https://api.telegram.org/bot{}/sendMessage"
 
 S = requests.Session()
-S.headers.update({"User-Agent": "dart-alert-github-actions/2.1"})
+S.headers.update({"User-Agent": "dart-alert-github-actions/3.0"})
 
 TG_MAX = 4096
 
@@ -103,7 +101,6 @@ def tg_send(text: str, button_url: str | None = None):
             {"inline_keyboard": [[{"text": "📄 DART 열기", "url": button_url}]]},
             ensure_ascii=False
         )
-
     r = S.post(TG_SEND.format(TG_BOT_TOKEN), data=payload, timeout=30)
     r.raise_for_status()
 
@@ -154,7 +151,7 @@ def fetch_list_pages():
             break
         out.extend(lst)
 
-        # total_count 기반 종료 (있을 때만)
+        # total_count 기반 종료(있을 때만)
         try:
             total = int(j.get("total_count") or 0)
             pc    = int(j.get("page_count") or PAGE_COUNT)
@@ -182,22 +179,13 @@ def fetch_list_pages():
 # =========================
 def _xml_to_text(xml_bytes: bytes) -> str:
     s = xml_bytes.decode("utf-8", errors="ignore")
-
-    # 줄바꿈 힌트
     s = re.sub(r"(?i)<br\s*/?>", "\n", s)
     s = re.sub(r"(?i)</(tr|p|div|li|h\d)>", "\n", s)
-
-    # 태그 제거
     s = re.sub(r"<[^>]+>", " ", s)
-
-    # 엔티티 decode
     s = html.unescape(s)
-
-    # 공백 정리
     s = re.sub(r"[ \t\r\f\v]+", " ", s)
     s = re.sub(r"\n\s+", "\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
-
     return s.strip()
 
 def fetch_document_text(rcept_no: str) -> str:
@@ -206,7 +194,6 @@ def fetch_document_text(rcept_no: str) -> str:
     raw = r.content
 
     texts = []
-    # ZIP 판별
     is_zip = (r.headers.get("Content-Type", "").lower().find("zip") >= 0) or (raw[:2] == b"PK")
     if is_zip:
         with zipfile.ZipFile(io.BytesIO(raw)) as z:
@@ -235,9 +222,6 @@ def classify_event_type(report_nm: str) -> str:
     return "N/A"
 
 def classify_allocation(doc_text: str) -> str:
-    """
-    return: '일반주주배정' | '주주배정' | 'N/A'
-    """
     if ALLOW_GENERAL.search(doc_text):
         return "일반주주배정"
     if ALLOW_SHAREHOLDER.search(doc_text):
@@ -245,88 +229,161 @@ def classify_allocation(doc_text: str) -> str:
     return "N/A"
 
 # =========================
-# 청약일정 추출 (원문 기반)
+# Field extraction helpers (운영형)
 # =========================
-def _normalize_ws(s: str) -> str:
-    s = re.sub(r"\s{2,}", " ", s).strip()
-    return s
+def _norm_ws(s: str) -> str:
+    return re.sub(r"\s{2,}", " ", (s or "")).strip()
 
-def extract_subscription_schedule(doc_text: str) -> str:
+def pick_first_by_labels(text: str, labels: list[str], maxlen: int = 120) -> str:
     """
-    원문 텍스트에서 청약 관련 라인을 여러 개 수집해서 한 줄로 합침.
-    - 우리사주/구주주/일반공모 등 라벨이 있으면 그 라벨 우선
-    - 없으면 '청약일' 라인이라도 수집
+    text에서 labels 중 하나가 포함된 라인의 '값'을 1개 뽑음.
+    표가 줄로 분리되는 경우를 대비해 다음 줄 1개까지 보조로 붙임.
     """
-    if not doc_text:
+    if not text:
         return "N/A"
-
-    # 라벨 후보 (우선순위)
-    labels = [
-        "우리사주조합 청약일", "우리사주조합청약일",
-        "구주주 청약일", "구주주청약일",
-        "일반공모 청약일", "일반공모청약일",
-        "일반청약일", "청약일",
-    ]
-
-    lines = [ln.strip() for ln in doc_text.splitlines() if ln.strip()]
-    hits = []
-
-    # 1) 라벨 기반 수집
-    for ln in lines:
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for i, ln in enumerate(lines):
         for lb in labels:
             if lb in ln:
                 after = ln.split(lb, 1)[1]
                 after = re.sub(r"^[\s:\-·•\)]+", "", after).strip()
-                after = _normalize_ws(after)
+                after = _norm_ws(after)
 
-                # 값이 비면 다음 라인 붙이기(표 분리 대비)
-                if len(after) < 2:
-                    # 다음 줄 1개만 붙이기(과도 결합 방지)
-                    idx = None
-                    try:
-                        idx = lines.index(ln)
-                    except Exception:
-                        idx = None
-                    if idx is not None and idx + 1 < len(lines):
-                        nxt = _normalize_ws(lines[idx + 1])
-                        if nxt and lb not in nxt:
-                            after = (after + " " + nxt).strip()
+                if len(after) < 2 and i + 1 < len(lines):
+                    nxt = _norm_ws(lines[i + 1])
+                    # 다음 줄이 또 라벨이면 붙이지 않음
+                    if nxt and not any(x in nxt for x in labels):
+                        after = _norm_ws((after + " " + nxt).strip())
 
                 if after:
-                    hits.append(f"{lb}: {after}")
+                    return after[:maxlen].strip()
+    return "N/A"
 
-    # 2) 라벨이 전혀 없으면, '청약' 키워드 라인 중 날짜 패턴이 있는 것 수집
-    if not hits:
-        date_pat = re.compile(
-            r"(\d{4}\s*[.\-/년]\s*\d{1,2}\s*[.\-/월]\s*\d{1,2}\s*일?)"
-            r"(\s*[~\-]\s*)?"
-            r"(\d{4}\s*[.\-/년]\s*\d{1,2}\s*[.\-/월]\s*\d{1,2}\s*일?)?",
-            re.I
-        )
-        for ln in lines:
-            if "청약" in ln:
-                m = date_pat.search(ln)
-                if m:
-                    hits.append(_normalize_ws(ln))
+def pick_multi_by_labels(text: str, labels: list[str], max_items: int = 6, maxlen_each: int = 80) -> str:
+    """
+    여러 라벨(우리사주/구주주/일반공모 청약일 등)을 모아서 한 줄로 합침.
+    """
+    if not text:
+        return "N/A"
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    hits = []
+    for i, ln in enumerate(lines):
+        for lb in labels:
+            if lb in ln:
+                after = ln.split(lb, 1)[1]
+                after = re.sub(r"^[\s:\-·•\)]+", "", after).strip()
+                after = _norm_ws(after)
+                if len(after) < 2 and i + 1 < len(lines):
+                    nxt = _norm_ws(lines[i + 1])
+                    if nxt and lb not in nxt:
+                        after = _norm_ws((after + " " + nxt).strip())
+                if after:
+                    hits.append(f"{lb}: {after[:maxlen_each].strip()}")
 
     # 중복 제거(순서 유지)
-    uniq = []
-    seen = set()
+    uniq, seen = [], set()
     for h in hits:
         key = re.sub(r"\s+", " ", h)
         if key in seen:
             continue
         seen.add(key)
         uniq.append(h)
+        if len(uniq) >= max_items:
+            break
 
     if not uniq:
         return "N/A"
-
-    # 너무 길면 적당히 자르기
     out = " / ".join(uniq)
-    if len(out) > 350:
-        out = out[:350] + "…"
-    return out
+    return out[:350] + ("…" if len(out) > 350 else "")
+
+def extract_money_purpose(text: str) -> str:
+    """
+    자금조달의목적: 표/문장 케이스가 다양해서
+    - '자금조달' / '자금사용목적' 라인이 있으면 그 라인 값
+    - 없으면 시설/운영/채무상환/타법인/기타 키워드가 붙은 라인 일부를 요약
+    """
+    # 1) 대표 라벨 우선
+    v = pick_first_by_labels(text, [
+        "자금조달의 목적", "자금조달 목적", "자금조달의목적",
+        "자금의 사용목적", "자금사용목적", "자금 사용 목적",
+        "조달자금의 사용목적", "조달 자금의 사용목적",
+    ], maxlen=160)
+    if v != "N/A":
+        return v
+
+    # 2) 표에서 목적 항목+금액이 흩어져 나오는 경우를 약식으로 수집
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    keys = ["시설", "운영", "채무", "타법인", "기타", "연구", "M&A", "인수", "투자"]
+    amt_pat = re.compile(r"(\d{1,3}(?:,\d{3})+|\d+)\s*원")
+    hits = []
+    for ln in lines:
+        if any(k in ln for k in keys) and amt_pat.search(ln):
+            hits.append(_norm_ws(ln))
+        if len(hits) >= 4:
+            break
+    if hits:
+        out = " / ".join(hits)
+        return out[:200] + ("…" if len(out) > 200 else "")
+    return "N/A"
+
+def extract_fields(doc_text: str) -> dict:
+    """
+    요청한 항목:
+    - 자금조달의목적
+    - 신주배정기준일
+    - 예정가
+    - 확정일
+    - 신주인수권상장예정기간
+    - 청약일
+    - 신주의상장예정일
+    """
+    fields = {}
+
+    fields["자금조달의목적"] = extract_money_purpose(doc_text)
+
+    fields["신주배정기준일"] = pick_first_by_labels(doc_text, [
+        "신주배정기준일", "신주 배정 기준일", "배정기준일", "배정 기준일",
+        "신주배정 기준일", "권리락 기준일",
+    ])
+
+    # 예정가 / 발행가(예정) 등 문구 변형 대응
+    fields["예정가"] = pick_first_by_labels(doc_text, [
+        "예정발행가액", "예정 발행가액", "발행가액(예정)", "발행가액 (예정)",
+        "예정발행가", "예정 발행가", "예정가", "예정가액",
+        "1주당 발행가액(예정)", "1주당 발행가액 (예정)",
+    ], maxlen=140)
+
+    fields["확정일"] = pick_first_by_labels(doc_text, [
+        "발행가액확정일", "발행가액 확정일",
+        "확정일", "가격확정일", "가격 확정일",
+        "발행가 확정일", "발행가액의 확정일",
+    ])
+
+    # 신주인수권 상장예정기간(권리 상장기간)
+    fields["신주인수권상장예정기간"] = pick_first_by_labels(doc_text, [
+        "신주인수권증서 상장예정기간", "신주인수권증서상장예정기간",
+        "신주인수권 상장예정기간", "신주인수권상장예정기간",
+        "신주인수권증서 상장기간", "신주인수권증서상장기간",
+        "신주인수권 상장기간", "신주인수권상장기간",
+    ], maxlen=160)
+
+    # 청약일(우리사주/구주주/일반공모 등 다중 라벨 합치기)
+    fields["청약일"] = pick_multi_by_labels(doc_text, [
+        "우리사주조합 청약일", "우리사주조합청약일",
+        "구주주 청약일", "구주주청약일",
+        "일반공모 청약일", "일반공모청약일",
+        "일반청약일",
+        "청약일",
+    ])
+
+    fields["신주의상장예정일"] = pick_first_by_labels(doc_text, [
+        "신주의 상장예정일", "신주의상장예정일",
+        "신주 상장예정일", "신주상장예정일",
+        "신주권 상장예정일", "신주권상장예정일",
+        "상장예정일",
+    ])
+
+    return fields
 
 # =========================
 # main
@@ -354,11 +411,10 @@ def main():
             mark_seen(st, rno)
             continue
 
-        # 원문 텍스트 가져와서 배정방식/제3자 여부 판정
+        # 원문 텍스트 가져와서 배정방식/제3자 여부/필드 추출
         try:
             doc_text = fetch_document_text(rno)
         except Exception:
-            # 원문을 못 가져오면 정책상 안전하게 제외(원문 기반 필터라서)
             mark_seen(st, rno)
             continue
 
@@ -369,13 +425,10 @@ def main():
 
         alloc = classify_allocation(doc_text)
         if alloc == "N/A":
-            # 일반주주/주주배정이 아닌 케이스는 제외
             mark_seen(st, rno)
             continue
 
-        # ✅ 청약일정 추출
-        subs = extract_subscription_schedule(doc_text)
-
+        fields = extract_fields(doc_text)
         ev_type = classify_event_type(rpt_nm)
 
         corp = (it.get("corp_name") or "N/A").strip()
@@ -389,7 +442,14 @@ def main():
             f"• 유형: <b>{html.escape(ev_type)}</b> / 배정: <b>{html.escape(alloc)}</b>",
             f"• 접수일: {html.escape(rcept_dt or 'N/A')}",
             f"• 공시명: {html.escape(rpt_nm)}",
-            f"• 청약일정: {html.escape(subs)}",
+            "",
+            f"• 자금조달의목적: {html.escape(fields['자금조달의목적'])}",
+            f"• 신주배정기준일: {html.escape(fields['신주배정기준일'])}",
+            f"• 예정가: {html.escape(fields['예정가'])}",
+            f"• 확정일: {html.escape(fields['확정일'])}",
+            f"• 신주인수권상장예정기간: {html.escape(fields['신주인수권상장예정기간'])}",
+            f"• 청약일: {html.escape(fields['청약일'])}",
+            f"• 신주의상장예정일: {html.escape(fields['신주의상장예정일'])}",
         ]
 
         tg_send_safe("\n".join(lines), button_url=url)
