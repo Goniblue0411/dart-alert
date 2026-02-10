@@ -28,6 +28,10 @@ PAGE_COUNT = int(os.getenv("PAGE_COUNT", "100"))
 STATE_PATH = "state.json"
 SEEN_MAX   = 8000
 
+# 네이버 금융 조회 타임아웃/재시도
+NAVER_TIMEOUT = int(os.getenv("NAVER_TIMEOUT", "20"))
+NAVER_RETRY   = int(os.getenv("NAVER_RETRY", "2"))
+
 # =========================
 # Filters (정책)
 # =========================
@@ -52,8 +56,10 @@ DOC_URL  = "https://opendart.fss.or.kr/api/document.xml"
 VIEW_URL = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo={}"
 TG_SEND  = "https://api.telegram.org/bot{}/sendMessage"
 
+NAVER_ITEM = "https://finance.naver.com/item/main.nhn?code={}"
+
 S = requests.Session()
-S.headers.update({"User-Agent": "dart-alert-github-actions/4.0"})
+S.headers.update({"User-Agent": "dart-alert-github-actions/6.0"})
 
 TG_MAX = 4096
 
@@ -356,6 +362,189 @@ def extract_fields(doc_text: str) -> dict:
     return fields
 
 # =========================
+# Money parsing / Raise amount (heuristic)
+# =========================
+def parse_int_kr(s: str) -> int:
+    if not s:
+        return 0
+    s = re.sub(r"[^\d,]", "", s)
+    if not s:
+        return 0
+    try:
+        return int(s.replace(",", ""))
+    except Exception:
+        return 0
+
+def fmt_won(n: int) -> str:
+    if n <= 0:
+        return "N/A"
+    return f"{n:,}원"
+
+def extract_raise_amount_krw(doc_text: str) -> int:
+    """
+    조달금액(추정):
+    - '모집', '매출', '금액' 근처의 'xxx원' 우선
+    - 없으면 문서 내 가장 큰 '원' 금액(상식적 상한 적용)
+    """
+    if not doc_text:
+        return 0
+
+    lines = [ln.strip() for ln in doc_text.splitlines() if ln.strip()]
+    amt_pat = re.compile(r"(\d{1,3}(?:,\d{3})+|\d+)\s*원")
+    focus_kw = re.compile(r"(모집|매출|발행|조달|자금|총액|금액)", re.I)
+
+    candidates = []
+    for ln in lines:
+        if not focus_kw.search(ln):
+            continue
+        for m in amt_pat.finditer(ln):
+            v = parse_int_kr(m.group(1))
+            if v > 0:
+                candidates.append(v)
+
+    # 1) 키워드 라인 후보가 있으면 그중 최대를 사용
+    if candidates:
+        v = max(candidates)
+        # 비정상 초대형 방지(100조 이상은 보통 오탐) - 필요시 조정
+        if v >= 100_000_000_000_000:
+            return 0
+        return v
+
+    # 2) fallback: 문서 전체에서 합리적 범위 내 최대 '원' 금액
+    all_vals = []
+    for ln in lines:
+        for m in amt_pat.finditer(ln):
+            v = parse_int_kr(m.group(1))
+            if v > 0:
+                all_vals.append(v)
+    if not all_vals:
+        return 0
+
+    v = max(all_vals)
+    if v >= 100_000_000_000_000:
+        return 0
+    return v
+
+# =========================
+# Naver finance: current price + market cap
+# =========================
+def fetch_naver_html(stock_code: str) -> str:
+    url = NAVER_ITEM.format(stock_code)
+    last = None
+    for _ in range(max(1, NAVER_RETRY)):
+        try:
+            r = S.get(url, timeout=NAVER_TIMEOUT)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"Naver fetch failed: {last}")
+
+def extract_current_price_from_naver(ht: str) -> int:
+    # 현재가 영역(여러 패턴 대응)
+    # 예) <p class="no_today"><span class="blind">12,340</span>
+    m = re.search(r'no_today[^>]*>\s*<[^>]*>\s*<span[^>]*class="blind"[^>]*>([\d,]+)</span>', ht, re.I | re.S)
+    if m:
+        return parse_int_kr(m.group(1))
+
+    # fallback: "현재가" 텍스트 근처
+    m = re.search(r"(현재가|종가)[^0-9]{0,30}([\d,]+)", ht)
+    if m:
+        return parse_int_kr(m.group(2))
+    return 0
+
+def extract_market_cap_from_naver(ht: str) -> int:
+    """
+    네이버는 시가총액을 '시가총액' 라벨 근처에 숫자로 노출.
+    단위가 '억원'로 보이는 경우가 있어 변환 처리.
+    """
+    # 1) "시가총액" 근처에서 숫자+단위(억원/조/원 등) 탐지
+    # 예: 시가총액 1조 2,345억 / 또는 12,345억원
+    m = re.search(r"시가총액\s*</th>\s*<td[^>]*>\s*([^<]+)</td>", ht, re.I | re.S)
+    if m:
+        raw = html.unescape(m.group(1))
+        raw = re.sub(r"\s+", " ", raw).strip()
+
+        # 형태: "12조 3,456억" 처리
+        tj = re.search(r"(\d{1,3}(?:,\d{3})+|\d+)\s*조", raw)
+        ek = re.search(r"(\d{1,3}(?:,\d{3})+|\d+)\s*억", raw)
+        if tj or ek:
+            val = 0
+            if tj:
+                val += parse_int_kr(tj.group(1)) * 1_0000_0000_0000  # 1조 = 1e12
+            if ek:
+                val += parse_int_kr(ek.group(1)) * 100_000_000        # 1억 = 1e8
+            return val if val > 0 else 0
+
+        # 형태: "12,345억원" 처리
+        m2 = re.search(r"([\d,]+)\s*억", raw)
+        if m2:
+            return parse_int_kr(m2.group(1)) * 100_000_000
+
+        # 형태: "123,456,789,000원" 처리
+        m3 = re.search(r"([\d,]+)\s*원", raw)
+        if m3:
+            return parse_int_kr(m3.group(1))
+
+    # 2) fallback: 본문에서 '시가총액' 다음 숫자/단위 탐지
+    m = re.search(r"시가총액[^0-9]{0,80}([\d,]+)\s*억", ht)
+    if m:
+        return parse_int_kr(m.group(1)) * 100_000_000
+
+    return 0
+
+def get_price_and_mcap(stock_code: str) -> tuple[int, int]:
+    if not stock_code or not re.fullmatch(r"\d{6}", stock_code):
+        return 0, 0
+    ht = fetch_naver_html(stock_code)
+    px = extract_current_price_from_naver(ht)
+    mc = extract_market_cap_from_naver(ht)
+    return px, mc
+
+# =========================
+# 최대주주 참여 여부(휴리스틱)
+# =========================
+def extract_major_shareholder_participation(doc_text: str) -> tuple[str, str]:
+    """
+    참여/불참/미확인 + 근거 문구 일부 반환
+    """
+    if not doc_text:
+        return "미확인", ""
+
+    lines = [ln.strip() for ln in doc_text.splitlines() if ln.strip()]
+    # 최대주주/특수관계인/최대주주의 청약/참여/인수 등
+    pat = re.compile(r"(최대\s*주주|최대주주|특수관계인|대주주).{0,60}(참여|청약|인수|불참|미참여|포기)", re.I)
+    neg = re.compile(r"(불참|미참여|포기)", re.I)
+    pos = re.compile(r"(참여|청약|인수)", re.I)
+
+    for ln in lines:
+        if "최대" not in ln and "대주주" not in ln and "특수" not in ln:
+            continue
+        m = pat.search(ln)
+        if not m:
+            continue
+        snippet = _norm_ws(ln)[:180]
+        if neg.search(ln):
+            return "불참", snippet
+        if pos.search(ln):
+            return "참여", snippet
+
+    # fallback: '최대주주' 문맥 1~2줄 합쳐서 판단
+    for i, ln in enumerate(lines):
+        if re.search(r"(최대\s*주주|최대주주|대주주|특수관계인)", ln):
+            ctx = ln
+            if i + 1 < len(lines):
+                ctx2 = _norm_ws(lines[i + 1])
+                if ctx2:
+                    ctx = _norm_ws(ctx + " " + ctx2)
+            if neg.search(ctx):
+                return "불참", ctx[:180]
+            if pos.search(ctx):
+                return "참여", ctx[:180]
+
+    return "미확인", ""
+
+# =========================
 # N/A 숨김 + 카드 렌더링 + 위험도
 # =========================
 def _is_empty_value(v: str) -> bool:
@@ -375,23 +564,25 @@ def add_if(lines: list[str], label: str, value: str):
         return
     lines.append(f"• <b>{html.escape(label)}</b>: {html.escape(value)}")
 
-def risk_score(ev_type: str, alloc: str, market: str, doc_text: str, fields: dict) -> tuple[int, str, str]:
+def fmt_pct(x: float) -> str:
+    return f"{x:.2f}%"
+
+def risk_score(ev_type: str, alloc: str, market: str, doc_text: str, fields: dict,
+               raise_krw: int, mcap_krw: int, discount_pct: float | None,
+               major_part: str) -> tuple[int, str, str]:
     """
-    0~100 휴리스틱.
-    - 유상/유무상 > 무상
-    - KOSDAQ/KONEX 가중
-    - 채무/운영 목적 가중
-    - 청약/예정가/확정일/인수권기간/상장예정일 정보가 많을수록(=유상 성격) 가중
+    0~100 휴리스틱(업그레이드):
+    - 기존(유형/시장/목적/일정) + 시총대비 비율 + 할인율 + 최대주주 불참 가중
     """
     score = 10
 
     et = (ev_type or "").strip()
     if et == "유상":
-        score += 40
+        score += 38
     elif et == "유무상":
-        score += 30
+        score += 28
     elif et == "무상":
-        score += 10
+        score += 8
     else:
         score += 15
 
@@ -405,13 +596,11 @@ def risk_score(ev_type: str, alloc: str, market: str, doc_text: str, fields: dic
     else:
         score += 7
 
-    # 배정 방식
     if alloc == "주주배정":
         score += 8
     elif alloc == "일반주주배정":
         score += 6
 
-    # 목적 키워드
     purpose = (fields.get("자금조달의목적") or "")
     if re.search(r"(채무|상환|차입|대출)", purpose):
         score += 18
@@ -420,45 +609,81 @@ def risk_score(ev_type: str, alloc: str, market: str, doc_text: str, fields: dic
     if re.search(r"(타법인|M&A|인수|취득|투자)", purpose):
         score += 12
 
-    # 일정/가격 정보가 많이 잡히면 실제 청약/발행 프로세스 가능성이 높음
     for k in ["청약일", "예정가", "확정일", "신주인수권상장예정기간", "신주의상장예정일"]:
         if not _is_empty_value(fields.get(k, "N/A")):
             score += 4
 
-    # 원문에서 "할인" "보통주" 등도 약간 반영(가벼운 힌트)
-    if re.search(r"(할인|발행가액|인수권)", doc_text):
-        score += 4
+    # ✅ 시총 대비 조달금액 비율 반영
+    if raise_krw > 0 and mcap_krw > 0:
+        ratio = raise_krw / mcap_krw  # 0~1+
+        if ratio >= 0.50:
+            score += 22
+        elif ratio >= 0.30:
+            score += 16
+        elif ratio >= 0.15:
+            score += 10
+        elif ratio >= 0.05:
+            score += 6
+        else:
+            score += 2
+
+    # ✅ 할인율 반영(예정가가 현재가 대비 크게 낮으면 이벤트 영향↑)
+    if discount_pct is not None:
+        if discount_pct >= 35:
+            score += 16
+        elif discount_pct >= 25:
+            score += 12
+        elif discount_pct >= 15:
+            score += 8
+        elif discount_pct >= 8:
+            score += 4
+
+    # ✅ 최대주주 참여(불참이면 가중)
+    if major_part == "불참":
+        score += 18
+    elif major_part == "참여":
+        score -= 6  # 참여는 리스크 완화 신호로 약하게 감점
 
     # clamp
     score = max(0, min(100, score))
 
-    if score >= 75:
+    if score >= 80:
         emoji, grade = "🔴", "높음"
-    elif score >= 55:
+    elif score >= 60:
         emoji, grade = "🟠", "중간"
-    elif score >= 35:
+    elif score >= 40:
         emoji, grade = "🟡", "낮음"
     else:
         emoji, grade = "🟢", "매우낮음"
     return score, grade, emoji
 
 def build_card(corp: str, market: str, ev_type: str, alloc: str, rcept_dt: str, rpt_nm: str, url: str,
-               doc_text: str, fields: dict) -> str:
-    score, grade, emoji = risk_score(ev_type, alloc, market, doc_text, fields)
+               doc_text: str, fields: dict, stock_code: str | None,
+               cur_px: int, mcap_krw: int, raise_krw: int,
+               ratio_pct: float | None, discount_pct: float | None,
+               major_part: str, major_snip: str) -> str:
 
-    # 카드 헤더
+    score, grade, emoji = risk_score(
+        ev_type, alloc, market, doc_text, fields,
+        raise_krw=raise_krw, mcap_krw=mcap_krw, discount_pct=discount_pct,
+        major_part=major_part
+    )
+
     lines = []
     lines.append(f"{emoji} <b>증자 공시 감지</b>  <i>(위험도 {score}/100 · {grade})</i>")
     lines.append(f"🏢 <b>{html.escape(corp)}</b>  <i>({html.escape(market)})</i>")
     lines.append(f"🧾 유형: <b>{html.escape(ev_type)}</b> / 배정: <b>{html.escape(alloc)}</b>")
     if rcept_dt:
         lines.append(f"📅 접수일: {html.escape(rcept_dt)}")
+    if stock_code and re.fullmatch(r"\d{6}", stock_code):
+        lines.append(f"🔎 종목코드: {html.escape(stock_code)}")
+
     lines.append("────────────────────")
     lines.append(f"📌 <b>공시명</b>")
     lines.append(f"{html.escape(rpt_nm)}")
     lines.append("────────────────────")
 
-    # 핵심 요약(필드 중 값 있는 것만 노출)
+    # 🧠 핵심
     core = []
     add_if(core, "자금조달의목적", fields.get("자금조달의목적", "N/A"))
     add_if(core, "신주배정기준일", fields.get("신주배정기준일", "N/A"))
@@ -467,7 +692,7 @@ def build_card(corp: str, market: str, ev_type: str, alloc: str, rcept_dt: str, 
         lines.extend(core)
         lines.append("────────────────────")
 
-    # 가격/일정 섹션
+    # 💰 가격
     price = []
     add_if(price, "예정가", fields.get("예정가", "N/A"))
     add_if(price, "확정일", fields.get("확정일", "N/A"))
@@ -476,6 +701,7 @@ def build_card(corp: str, market: str, ev_type: str, alloc: str, rcept_dt: str, 
         lines.extend(price)
         lines.append("────────────────────")
 
+    # 🗓️ 일정
     sched = []
     add_if(sched, "신주인수권상장예정기간", fields.get("신주인수권상장예정기간", "N/A"))
     add_if(sched, "청약일", fields.get("청약일", "N/A"))
@@ -485,10 +711,42 @@ def build_card(corp: str, market: str, ev_type: str, alloc: str, rcept_dt: str, 
         lines.extend(sched)
         lines.append("────────────────────")
 
-    # 맨 아래 링크 문구(버튼이 있으니 텍스트는 짧게)
-    lines.append("➡️ 아래 버튼으로 원문 확인")
+    # 📊 규모/비율/할인
+    size = []
+    if raise_krw > 0:
+        add_if(size, "조달금액(추정)", fmt_won(raise_krw))
+    if mcap_krw > 0:
+        add_if(size, "시가총액(추정)", fmt_won(mcap_krw))
+    if ratio_pct is not None:
+        add_if(size, "시총 대비 조달비율", fmt_pct(ratio_pct))
+    if cur_px > 0:
+        add_if(size, "현재가(추정)", f"{cur_px:,}원")
+    if discount_pct is not None:
+        add_if(size, "예정가 할인율", fmt_pct(discount_pct))
+    if major_part != "미확인":
+        add_if(size, "최대주주 참여", major_part)
+        if major_snip:
+            add_if(size, "근거", major_snip)
 
+    if size:
+        lines.append("📊 <b>규모/리스크 보강</b>")
+        lines.extend(size)
+        lines.append("────────────────────")
+
+    lines.append("➡️ 아래 버튼으로 원문 확인")
     return "\n".join(lines)
+
+# =========================
+# helpers: 예정가 숫자 추출
+# =========================
+def extract_issue_price_from_field(v: str) -> int:
+    # "12,345원" "12,345" 같은 형태에서 숫자만
+    if not v or v.strip().upper() == "N/A":
+        return 0
+    m = re.search(r"([\d,]+)\s*원?", v)
+    if not m:
+        return 0
+    return parse_int_kr(m.group(1))
 
 # =========================
 # main
@@ -541,6 +799,35 @@ def main():
         url = VIEW_URL.format(rno)
         market_name = {"Y": "KOSPI", "K": "KOSDAQ", "N": "KONEX", "E": "OTHER"}.get(corp_cls, corp_cls or "N/A")
 
+        # ✅ 조달금액(추정)
+        raise_krw = extract_raise_amount_krw(doc_text)
+
+        # ✅ 종목코드(있으면 시총/현재가/할인율 계산)
+        stock_code = (it.get("stock_code") or "").strip()
+        if not re.fullmatch(r"\d{6}", stock_code):
+            stock_code = ""
+
+        cur_px, mcap_krw = (0, 0)
+        if stock_code:
+            try:
+                cur_px, mcap_krw = get_price_and_mcap(stock_code)
+            except Exception:
+                cur_px, mcap_krw = (0, 0)
+
+        # ✅ 시총 대비 비율(%)
+        ratio_pct = None
+        if raise_krw > 0 and mcap_krw > 0:
+            ratio_pct = (raise_krw / mcap_krw) * 100.0
+
+        # ✅ 할인율(%): 예정가 vs 현재가
+        discount_pct = None
+        issue_px = extract_issue_price_from_field(fields.get("예정가", "N/A"))
+        if issue_px > 0 and cur_px > 0:
+            discount_pct = (1.0 - (issue_px / cur_px)) * 100.0
+
+        # ✅ 최대주주 참여 여부
+        major_part, major_snip = extract_major_shareholder_participation(doc_text)
+
         msg = build_card(
             corp=corp,
             market=market_name,
@@ -550,7 +837,15 @@ def main():
             rpt_nm=rpt_nm,
             url=url,
             doc_text=doc_text,
-            fields=fields
+            fields=fields,
+            stock_code=stock_code or None,
+            cur_px=cur_px,
+            mcap_krw=mcap_krw,
+            raise_krw=raise_krw,
+            ratio_pct=ratio_pct,
+            discount_pct=discount_pct,
+            major_part=major_part,
+            major_snip=major_snip,
         )
 
         tg_send_safe(msg, button_url=url)
