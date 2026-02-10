@@ -13,7 +13,7 @@ TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"].strip()
 TG_CHAT_ID   = os.environ["TG_CHAT_ID"].strip()
 
 # =========================
-# Config (workflow env override 가능)
+# Config
 # =========================
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "3"))
 
@@ -53,7 +53,7 @@ VIEW_URL = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo={}"
 TG_SEND  = "https://api.telegram.org/bot{}/sendMessage"
 
 S = requests.Session()
-S.headers.update({"User-Agent": "dart-alert-github-actions/3.0"})
+S.headers.update({"User-Agent": "dart-alert-github-actions/4.0"})
 
 TG_MAX = 4096
 
@@ -229,16 +229,12 @@ def classify_allocation(doc_text: str) -> str:
     return "N/A"
 
 # =========================
-# Field extraction helpers (운영형)
+# Field extraction
 # =========================
 def _norm_ws(s: str) -> str:
     return re.sub(r"\s{2,}", " ", (s or "")).strip()
 
-def pick_first_by_labels(text: str, labels: list[str], maxlen: int = 120) -> str:
-    """
-    text에서 labels 중 하나가 포함된 라인의 '값'을 1개 뽑음.
-    표가 줄로 분리되는 경우를 대비해 다음 줄 1개까지 보조로 붙임.
-    """
+def pick_first_by_labels(text: str, labels: list[str], maxlen: int = 140) -> str:
     if not text:
         return "N/A"
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -251,7 +247,6 @@ def pick_first_by_labels(text: str, labels: list[str], maxlen: int = 120) -> str
 
                 if len(after) < 2 and i + 1 < len(lines):
                     nxt = _norm_ws(lines[i + 1])
-                    # 다음 줄이 또 라벨이면 붙이지 않음
                     if nxt and not any(x in nxt for x in labels):
                         after = _norm_ws((after + " " + nxt).strip())
 
@@ -259,10 +254,7 @@ def pick_first_by_labels(text: str, labels: list[str], maxlen: int = 120) -> str
                     return after[:maxlen].strip()
     return "N/A"
 
-def pick_multi_by_labels(text: str, labels: list[str], max_items: int = 6, maxlen_each: int = 80) -> str:
-    """
-    여러 라벨(우리사주/구주주/일반공모 청약일 등)을 모아서 한 줄로 합침.
-    """
+def pick_multi_by_labels(text: str, labels: list[str], max_items: int = 6, maxlen_each: int = 90) -> str:
     if not text:
         return "N/A"
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -280,7 +272,6 @@ def pick_multi_by_labels(text: str, labels: list[str], max_items: int = 6, maxle
                 if after:
                     hits.append(f"{lb}: {after[:maxlen_each].strip()}")
 
-    # 중복 제거(순서 유지)
     uniq, seen = [], set()
     for h in hits:
         key = re.sub(r"\s+", " ", h)
@@ -294,24 +285,17 @@ def pick_multi_by_labels(text: str, labels: list[str], max_items: int = 6, maxle
     if not uniq:
         return "N/A"
     out = " / ".join(uniq)
-    return out[:350] + ("…" if len(out) > 350 else "")
+    return out[:420] + ("…" if len(out) > 420 else "")
 
 def extract_money_purpose(text: str) -> str:
-    """
-    자금조달의목적: 표/문장 케이스가 다양해서
-    - '자금조달' / '자금사용목적' 라인이 있으면 그 라인 값
-    - 없으면 시설/운영/채무상환/타법인/기타 키워드가 붙은 라인 일부를 요약
-    """
-    # 1) 대표 라벨 우선
     v = pick_first_by_labels(text, [
         "자금조달의 목적", "자금조달 목적", "자금조달의목적",
         "자금의 사용목적", "자금사용목적", "자금 사용 목적",
         "조달자금의 사용목적", "조달 자금의 사용목적",
-    ], maxlen=160)
+    ], maxlen=220)
     if v != "N/A":
         return v
 
-    # 2) 표에서 목적 항목+금액이 흩어져 나오는 경우를 약식으로 수집
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     keys = ["시설", "운영", "채무", "타법인", "기타", "연구", "M&A", "인수", "투자"]
     amt_pat = re.compile(r"(\d{1,3}(?:,\d{3})+|\d+)\s*원")
@@ -323,22 +307,11 @@ def extract_money_purpose(text: str) -> str:
             break
     if hits:
         out = " / ".join(hits)
-        return out[:200] + ("…" if len(out) > 200 else "")
+        return out[:240] + ("…" if len(out) > 240 else "")
     return "N/A"
 
 def extract_fields(doc_text: str) -> dict:
-    """
-    요청한 항목:
-    - 자금조달의목적
-    - 신주배정기준일
-    - 예정가
-    - 확정일
-    - 신주인수권상장예정기간
-    - 청약일
-    - 신주의상장예정일
-    """
     fields = {}
-
     fields["자금조달의목적"] = extract_money_purpose(doc_text)
 
     fields["신주배정기준일"] = pick_first_by_labels(doc_text, [
@@ -346,12 +319,11 @@ def extract_fields(doc_text: str) -> dict:
         "신주배정 기준일", "권리락 기준일",
     ])
 
-    # 예정가 / 발행가(예정) 등 문구 변형 대응
     fields["예정가"] = pick_first_by_labels(doc_text, [
         "예정발행가액", "예정 발행가액", "발행가액(예정)", "발행가액 (예정)",
         "예정발행가", "예정 발행가", "예정가", "예정가액",
         "1주당 발행가액(예정)", "1주당 발행가액 (예정)",
-    ], maxlen=140)
+    ], maxlen=160)
 
     fields["확정일"] = pick_first_by_labels(doc_text, [
         "발행가액확정일", "발행가액 확정일",
@@ -359,15 +331,13 @@ def extract_fields(doc_text: str) -> dict:
         "발행가 확정일", "발행가액의 확정일",
     ])
 
-    # 신주인수권 상장예정기간(권리 상장기간)
     fields["신주인수권상장예정기간"] = pick_first_by_labels(doc_text, [
         "신주인수권증서 상장예정기간", "신주인수권증서상장예정기간",
         "신주인수권 상장예정기간", "신주인수권상장예정기간",
         "신주인수권증서 상장기간", "신주인수권증서상장기간",
         "신주인수권 상장기간", "신주인수권상장기간",
-    ], maxlen=160)
+    ], maxlen=200)
 
-    # 청약일(우리사주/구주주/일반공모 등 다중 라벨 합치기)
     fields["청약일"] = pick_multi_by_labels(doc_text, [
         "우리사주조합 청약일", "우리사주조합청약일",
         "구주주 청약일", "구주주청약일",
@@ -384,6 +354,141 @@ def extract_fields(doc_text: str) -> dict:
     ])
 
     return fields
+
+# =========================
+# N/A 숨김 + 카드 렌더링 + 위험도
+# =========================
+def _is_empty_value(v: str) -> bool:
+    if v is None:
+        return True
+    s = str(v).strip()
+    if not s:
+        return True
+    if s.upper() == "N/A":
+        return True
+    if s in ("0", "0원", "0 주", "0주"):
+        return True
+    return False
+
+def add_if(lines: list[str], label: str, value: str):
+    if _is_empty_value(value):
+        return
+    lines.append(f"• <b>{html.escape(label)}</b>: {html.escape(value)}")
+
+def risk_score(ev_type: str, alloc: str, market: str, doc_text: str, fields: dict) -> tuple[int, str, str]:
+    """
+    0~100 휴리스틱.
+    - 유상/유무상 > 무상
+    - KOSDAQ/KONEX 가중
+    - 채무/운영 목적 가중
+    - 청약/예정가/확정일/인수권기간/상장예정일 정보가 많을수록(=유상 성격) 가중
+    """
+    score = 10
+
+    et = (ev_type or "").strip()
+    if et == "유상":
+        score += 40
+    elif et == "유무상":
+        score += 30
+    elif et == "무상":
+        score += 10
+    else:
+        score += 15
+
+    mk = (market or "").upper()
+    if mk == "KOSDAQ":
+        score += 10
+    elif mk == "KONEX":
+        score += 15
+    elif mk == "KOSPI":
+        score += 5
+    else:
+        score += 7
+
+    # 배정 방식
+    if alloc == "주주배정":
+        score += 8
+    elif alloc == "일반주주배정":
+        score += 6
+
+    # 목적 키워드
+    purpose = (fields.get("자금조달의목적") or "")
+    if re.search(r"(채무|상환|차입|대출)", purpose):
+        score += 18
+    if re.search(r"(운영|운전자금)", purpose):
+        score += 10
+    if re.search(r"(타법인|M&A|인수|취득|투자)", purpose):
+        score += 12
+
+    # 일정/가격 정보가 많이 잡히면 실제 청약/발행 프로세스 가능성이 높음
+    for k in ["청약일", "예정가", "확정일", "신주인수권상장예정기간", "신주의상장예정일"]:
+        if not _is_empty_value(fields.get(k, "N/A")):
+            score += 4
+
+    # 원문에서 "할인" "보통주" 등도 약간 반영(가벼운 힌트)
+    if re.search(r"(할인|발행가액|인수권)", doc_text):
+        score += 4
+
+    # clamp
+    score = max(0, min(100, score))
+
+    if score >= 75:
+        emoji, grade = "🔴", "높음"
+    elif score >= 55:
+        emoji, grade = "🟠", "중간"
+    elif score >= 35:
+        emoji, grade = "🟡", "낮음"
+    else:
+        emoji, grade = "🟢", "매우낮음"
+    return score, grade, emoji
+
+def build_card(corp: str, market: str, ev_type: str, alloc: str, rcept_dt: str, rpt_nm: str, url: str,
+               doc_text: str, fields: dict) -> str:
+    score, grade, emoji = risk_score(ev_type, alloc, market, doc_text, fields)
+
+    # 카드 헤더
+    lines = []
+    lines.append(f"{emoji} <b>증자 공시 감지</b>  <i>(위험도 {score}/100 · {grade})</i>")
+    lines.append(f"🏢 <b>{html.escape(corp)}</b>  <i>({html.escape(market)})</i>")
+    lines.append(f"🧾 유형: <b>{html.escape(ev_type)}</b> / 배정: <b>{html.escape(alloc)}</b>")
+    if rcept_dt:
+        lines.append(f"📅 접수일: {html.escape(rcept_dt)}")
+    lines.append("────────────────────")
+    lines.append(f"📌 <b>공시명</b>")
+    lines.append(f"{html.escape(rpt_nm)}")
+    lines.append("────────────────────")
+
+    # 핵심 요약(필드 중 값 있는 것만 노출)
+    core = []
+    add_if(core, "자금조달의목적", fields.get("자금조달의목적", "N/A"))
+    add_if(core, "신주배정기준일", fields.get("신주배정기준일", "N/A"))
+    if core:
+        lines.append("🧠 <b>핵심</b>")
+        lines.extend(core)
+        lines.append("────────────────────")
+
+    # 가격/일정 섹션
+    price = []
+    add_if(price, "예정가", fields.get("예정가", "N/A"))
+    add_if(price, "확정일", fields.get("확정일", "N/A"))
+    if price:
+        lines.append("💰 <b>가격</b>")
+        lines.extend(price)
+        lines.append("────────────────────")
+
+    sched = []
+    add_if(sched, "신주인수권상장예정기간", fields.get("신주인수권상장예정기간", "N/A"))
+    add_if(sched, "청약일", fields.get("청약일", "N/A"))
+    add_if(sched, "신주의상장예정일", fields.get("신주의상장예정일", "N/A"))
+    if sched:
+        lines.append("🗓️ <b>일정</b>")
+        lines.extend(sched)
+        lines.append("────────────────────")
+
+    # 맨 아래 링크 문구(버튼이 있으니 텍스트는 짧게)
+    lines.append("➡️ 아래 버튼으로 원문 확인")
+
+    return "\n".join(lines)
 
 # =========================
 # main
@@ -411,14 +516,14 @@ def main():
             mark_seen(st, rno)
             continue
 
-        # 원문 텍스트 가져와서 배정방식/제3자 여부/필드 추출
+        # 원문 텍스트 가져오기
         try:
             doc_text = fetch_document_text(rno)
         except Exception:
             mark_seen(st, rno)
             continue
 
-        # 제3자배정 포함이면 무조건 제외
+        # 제3자배정 포함이면 제외
         if EXC_3RD.search(doc_text):
             mark_seen(st, rno)
             continue
@@ -436,23 +541,20 @@ def main():
         url = VIEW_URL.format(rno)
         market_name = {"Y": "KOSPI", "K": "KOSDAQ", "N": "KONEX", "E": "OTHER"}.get(corp_cls, corp_cls or "N/A")
 
-        lines = [
-            "📌 <b>증자 공시 감지</b>",
-            f"• 회사: <b>{html.escape(corp)}</b> <i>({html.escape(market_name)})</i>",
-            f"• 유형: <b>{html.escape(ev_type)}</b> / 배정: <b>{html.escape(alloc)}</b>",
-            f"• 접수일: {html.escape(rcept_dt or 'N/A')}",
-            f"• 공시명: {html.escape(rpt_nm)}",
-            "",
-            f"• 자금조달의목적: {html.escape(fields['자금조달의목적'])}",
-            f"• 신주배정기준일: {html.escape(fields['신주배정기준일'])}",
-            f"• 예정가: {html.escape(fields['예정가'])}",
-            f"• 확정일: {html.escape(fields['확정일'])}",
-            f"• 신주인수권상장예정기간: {html.escape(fields['신주인수권상장예정기간'])}",
-            f"• 청약일: {html.escape(fields['청약일'])}",
-            f"• 신주의상장예정일: {html.escape(fields['신주의상장예정일'])}",
-        ]
+        msg = build_card(
+            corp=corp,
+            market=market_name,
+            ev_type=ev_type,
+            alloc=alloc,
+            rcept_dt=rcept_dt,
+            rpt_nm=rpt_nm,
+            url=url,
+            doc_text=doc_text,
+            fields=fields
+        )
 
-        tg_send_safe("\n".join(lines), button_url=url)
+        tg_send_safe(msg, button_url=url)
+
         mark_seen(st, rno)
         sent += 1
 
