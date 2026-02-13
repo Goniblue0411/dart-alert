@@ -1,15 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+bot.py - DART Rights Issue Telegram Alert (UI like screenshot)
+- Extract: 유상증자 관련 공시
+- Exclude: 제3자배정 유상증자 (제3자/특정인 배정 포함)
+- Telegram: card-like text + inline button "📄 DART 열기"
+- Dedup: state.json
+
+ENV (required)
+  DART_API_KEY
+  TG_BOT_TOKEN
+  TG_CHAT_ID
+
+ENV (optional)
+  LOOKBACK_DAYS=3
+  MARKET_CLASSES="Y,K,N"     # Y:유가, K:코스닥, N:코넥스
+  POLL_SLEEP_SEC=0           # 0이면 1회 실행, 30~300이면 계속 폴링
+  STATE_PATH="state.json"
+"""
+
+from __future__ import annotations
 
 import os
+import re
 import json
 import time
-import re
-import html
-import io
-import zipfile
-import requests
+import html as html_lib
 from datetime import datetime, timedelta
+
+import requests
+
 
 # =========================
 # ENV
@@ -18,337 +38,355 @@ DART_API_KEY = os.getenv("DART_API_KEY", "").strip()
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID   = os.getenv("TG_CHAT_ID", "").strip()
 
-LOOKBACK_DAYS   = int(os.getenv("LOOKBACK_DAYS", "3"))
-MARKET_CLASSES  = [x.strip().upper() for x in os.getenv("MARKET_CLASSES", "Y,K,N").split(",") if x.strip()]
-POLL_SLEEP_SEC  = int(os.getenv("POLL_SLEEP_SEC", "0"))  # GitHub Actions는 0 권장(한번만 실행)
-
-STATE_PATH = "state.json"
+LOOKBACK_DAYS  = int(os.getenv("LOOKBACK_DAYS", "3"))
+MARKET_CLASSES = [x.strip().upper() for x in os.getenv("MARKET_CLASSES", "Y,K,N").split(",") if x.strip()]
+POLL_SLEEP_SEC = int(os.getenv("POLL_SLEEP_SEC", "0"))
+STATE_PATH     = os.getenv("STATE_PATH", "state.json").strip()
 
 DART_LIST_URL = "https://opendart.fss.or.kr/api/list.json"
-DART_DOC_URL  = "https://opendart.fss.or.kr/api/document.xml"  # zip 반환
 DART_VIEW_URL = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcpNo}"
 
 TG_SEND_URL = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
 
-S = requests.Session()
-S.headers.update({"User-Agent": "dart-alert/ops/1.1"})
+UA_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; DART-RightsIssueBot/2.0)"}
+
 
 # =========================
-# Regex / Keywords
+# Filters: exclude 3rd-party allocation
 # =========================
-# 기본: 증자 관련
-INC_TITLE = re.compile(r"(유상증자|무상증자)", re.I)
+BANNED_TITLE_TOKENS = [
+    "제3자", "제삼자", "제3자배정", "제삼자배정",
+    "특정인", "제3자 배정", "제 삼자 배정",
+    "third party", "3rd party",
+]
 
-# 유상/무상 결정/정정류 (넓게)
-INC_REPORT = re.compile(
-    r"(유상증자결정|무상증자결정|주요사항보고서\(유상증자결정\)|주요사항보고서\(무상증자결정\)|정정.*유상증자|정정.*무상증자)",
-    re.I
-)
+# 본문에서 제3자배정 흔적 탐지(공백/표기 흔들림 포함)
+BANNED_BODY_PATTERNS = [
+    r"제\s*3\s*자\s*배정",
+    r"제\s*삼\s*자\s*배정",
+    r"제3자\s*배정",
+    r"제삼자\s*배정",
+    r"특정인\s*배정",
+    r"third\s*party\s*allocation",
+    r"3rd\s*party\s*allocation",
+]
 
-# ✅ 제3자배정 제외(강화: 제삼자/띄어쓰기/영문/증자 단어 포함 변형까지)
-THIRD_PARTY = re.compile(
-    r"(제\s*[삼3]\s*자\s*배정(\s*증자)?|제\s*[삼3]\s*자\s*배정\s*유상증자|third\s*party|3rd\s*party)",
-    re.I
-)
+RIGHTS_TITLE_KEYWORDS = [
+    "유상증자",
+    "유상증자결정",
+    "유상증자 결정",
+    "유상증자또는주식관련사채등의발행결과",
+    "유상증자또는주식관련사채등의발행결과(자율공시)",
+]
 
-# 포함하고 싶은 “일반/주주배정” 힌트(문서에서 가점)
-INCLUDE_HINT = re.compile(r"(일반공모|일반\s*주주|주주배정|구주주|기존주주)", re.I)
+# 무상증자는 기본 제외 (원하면 제거)
+BANNED_NON_TARGET = [
+    "무상증자",
+]
 
-# XML/HTML 태그 제거용(대충 텍스트화)
-TAG_RE = re.compile(r"<[^>]+>")
 
-# =========================
-# Helpers
-# =========================
-def load_state():
+def _norm(s: str) -> str:
+    return (s or "").strip()
+
+
+def is_rights_issue_title(report_nm: str) -> bool:
+    """제목 기반 1차: 유상증자 계열 포함 + 제3자/특정인 배정 토큰 제외 + 무상증자 제외"""
+    report_nm = _norm(report_nm)
+    if not report_nm:
+        return False
+
+    if not any(k in report_nm for k in RIGHTS_TITLE_KEYWORDS):
+        # "유상증자"가 포함된 다양한 제목도 잡기 위해 보완:
+        if "유상증자" not in report_nm:
+            return False
+
+    if any(x in report_nm for x in BANNED_NON_TARGET):
+        return False
+
+    low = report_nm.lower()
+    if any(tok.lower() in low for tok in BANNED_TITLE_TOKENS):
+        return False
+
+    return True
+
+
+def body_contains_third_party(text: str) -> bool:
+    """본문(HTML/텍스트)에 제3자배정 흔적이 있으면 True"""
+    text = _norm(text)
+    if not text:
+        return False
+    for pat in BANNED_BODY_PATTERNS:
+        if re.search(pat, text, flags=re.IGNORECASE):
+            return True
+    return False
+
+
+def fetch_text(url: str, timeout: int = 12) -> str:
+    r = requests.get(url, timeout=timeout, headers=UA_HEADERS)
+    r.raise_for_status()
+    return r.text
+
+
+def fetch_dart_main_and_related(rcp_no: str) -> str:
+    """
+    main.do + (있으면) 관련 viewer 링크까지 일부 추가 수집
+    - 제3자배정이 제목에 없고 본문에만 있는 케이스 방지용
+    """
+    main_url = DART_VIEW_URL.format(rcpNo=rcp_no)
+    main_html = fetch_text(main_url)
+
+    urls = {main_url}
+
+    # main.do 안의 href를 스캔해서 viewer/보고서 링크를 최대 3개까지 추가로 가져옴
+    for m in re.finditer(r'href="([^"]+)"', main_html, flags=re.IGNORECASE):
+        href = m.group(1) or ""
+        if not href:
+            continue
+
+        # viewer/report 관련 링크만
+        if ("viewer" not in href) and ("report" not in href) and ("dsaf001" not in href):
+            continue
+
+        if href.startswith("/"):
+            href = "https://dart.fss.or.kr" + href
+        elif href.startswith("http"):
+            pass
+        else:
+            continue
+
+        if "rcpNo=" in href and rcp_no in href:
+            urls.add(href)
+
+        if len(urls) >= 4:  # main 포함 최대 4개
+            break
+
+    combined = [main_html]
+    fetched = 0
+    for u in list(urls):
+        if u == main_url:
+            continue
+        if fetched >= 3:
+            break
+        try:
+            combined.append(fetch_text(u))
+            fetched += 1
+        except Exception:
+            continue
+
+    return "\n\n".join(combined)
+
+
+def is_allowed_rights_issue(report_nm: str, rcp_no: str) -> bool:
+    """최종: 유상증자이며 제3자배정이 아닌 경우만 True"""
+    if not is_rights_issue_title(report_nm):
+        return False
+
+    # 본문 확인 (실패 시 안전하게 제외)
     try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            st = json.load(f)
-        if "seen" not in st or not isinstance(st["seen"], list):
-            st["seen"] = []
-        return st
+        combined_html = fetch_dart_main_and_related(rcp_no)
     except Exception:
-        return {"seen": []}
+        return False
 
-def save_state(st):
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(st, f, ensure_ascii=False, indent=2)
+    if body_contains_third_party(combined_html):
+        return False
 
-def tg_send_card(title: str, body_lines: list, button_url: str):
-    """
-    HTML 모드로 안전 전송 + 항상 버튼 포함
-    """
-    safe_title = html.escape(title)
-    safe_lines = [html.escape(x) for x in body_lines if x and x.strip()]
-    text = f"<b>{safe_title}</b>\n" + "\n".join(safe_lines)
+    return True
+
+
+# =========================
+# State (dedup)
+# =========================
+def load_state(path: str) -> dict:
+    if not os.path.exists(path):
+        return {"seen": {}}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"seen": {}}
+
+
+def save_state(path: str, state: dict) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def already_seen(state: dict, rcp_no: str) -> bool:
+    return rcp_no in state.get("seen", {})
+
+
+def mark_seen(state: dict, rcp_no: str, meta: dict) -> None:
+    state.setdefault("seen", {})[rcp_no] = meta
+
+
+# =========================
+# Telegram (UI like screenshot)
+# =========================
+def fmt_msg(item: dict) -> str:
+    corp_name = _norm(item.get("corp_name", ""))
+    corp_cls  = _norm(item.get("corp_cls", ""))  # Y/K/N
+    report_nm = _norm(item.get("report_nm", ""))
+    rcp_no    = _norm(item.get("rcp_no", ""))
+    rcept_dt  = _norm(item.get("rcept_dt", ""))
+
+    dt_str = rcept_dt
+    if len(rcept_dt) == 8:
+        dt_str = f"{rcept_dt[:4]}-{rcept_dt[4:6]}-{rcept_dt[6:8]}"
+
+    corp_name_e = html_lib.escape(corp_name)
+    report_nm_e = html_lib.escape(report_nm)
+
+    # 스샷처럼 구성(카드형 텍스트)
+    text = (
+        "📌 <b>증자 공시 감지</b>\n"
+        f"• 회사: {corp_name_e} ({corp_cls})\n"
+        f"• 접수일: {dt_str}\n"
+        "공시\n"
+        f"– {report_nm_e}\n"
+        f"({rcp_no})"
+    )
+    return text
+
+
+def tg_send(text: str, dart_url: str) -> None:
+    if not (TG_BOT_TOKEN and TG_CHAT_ID):
+        raise RuntimeError("Missing TG_BOT_TOKEN or TG_CHAT_ID env")
+
+    reply_markup = {
+        "inline_keyboard": [
+            [{"text": "📄 DART 열기", "url": dart_url}]
+        ]
+    }
 
     payload = {
         "chat_id": TG_CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
-        "reply_markup": json.dumps({
-            "inline_keyboard": [
-                [{"text": "📄 DART 열기", "url": button_url}]
-            ]
-        }, ensure_ascii=False)
+        # 텔레그램은 reply_markup를 JSON 문자열로 보내는 게 가장 안전
+        "reply_markup": json.dumps(reply_markup, ensure_ascii=False),
     }
 
-    r = S.post(TG_SEND_URL, data=payload, timeout=20)
-    if not r.ok:
-        raise RuntimeError(f"Telegram send failed: {r.status_code} {r.text[:200]}")
-
-def dart_list(start_date: str, end_date: str, page_no: int):
-    """
-    DART list.json pagination
-    """
-    params = {
-        "crtfc_key": DART_API_KEY,
-        "bgn_de": start_date,
-        "end_de": end_date,
-        "page_no": page_no,
-        "page_count": 100,
-    }
-    r = S.get(DART_LIST_URL, params=params, timeout=20)
+    r = requests.post(TG_SEND_URL, data=payload, timeout=12)
     r.raise_for_status()
-    return r.json()
 
-def get_view_html(rcp_no: str) -> str:
+
+# =========================
+# DART list fetch
+# =========================
+def fetch_items_window(days: int) -> list[dict]:
     """
-    DART 뷰어(main.do) HTML
-    - 텍스트가 스크립트로 로딩되는 경우가 많아 '보조' 자료로만 사용
+    최근 N일치 공시를 가져오되 corp_cls(Y/K/N)를 각각 조회하여 합침
     """
-    url = DART_VIEW_URL.format(rcpNo=rcp_no)
-    r = S.get(url, timeout=25)
-    if not r.ok:
-        return ""
-    return r.text
+    end = datetime.now()
+    start = end - timedelta(days=max(1, days))
 
-def get_document_text(rcp_no: str) -> str:
-    """
-    ✅ OpenDART document.xml API (zip)에서 원문(XML) 텍스트를 최대한 추출
-    - 실패하면 "" 반환
-    """
-    try:
-        params = {"crtfc_key": DART_API_KEY, "rcept_no": rcp_no}
-        r = S.get(DART_DOC_URL, params=params, timeout=25)
-        if not r.ok or not r.content:
-            return ""
+    bgn_de = start.strftime("%Y%m%d")
+    end_de = end.strftime("%Y%m%d")
 
-        # zip인지 확인(대부분 PK..)
-        content = r.content
-        if not content.startswith(b"PK"):
-            # 에러 응답이 xml/text로 올 수도 있음
-            try:
-                return content.decode("utf-8", errors="ignore")
-            except Exception:
-                return ""
+    all_items: dict[str, dict] = {}
+    corp_classes = MARKET_CLASSES or ["Y", "K", "N"]
 
-        zf = zipfile.ZipFile(io.BytesIO(content))
-        texts = []
-        for name in zf.namelist():
-            # 본문 xml/html들만
-            if not (name.lower().endswith(".xml") or name.lower().endswith(".html") or name.lower().endswith(".htm")):
-                continue
-            try:
-                raw = zf.read(name)
-                # DART 문서는 euc-kr/utf-8 섞임 -> 안전 디코드
-                s = raw.decode("utf-8", errors="ignore")
-                if not s.strip():
-                    s = raw.decode("euc-kr", errors="ignore")
-                if s.strip():
-                    # 태그 대충 제거
-                    s = TAG_RE.sub(" ", s)
-                    s = html.unescape(s)
-                    texts.append(s)
-            except Exception:
-                continue
+    for cls in corp_classes:
+        page_no = 1
+        while True:
+            params = {
+                "crtfc_key": DART_API_KEY,
+                "bgn_de": bgn_de,
+                "end_de": end_de,
+                "page_no": page_no,
+                "page_count": 100,
+                "corp_cls": cls,
+            }
+            r = requests.get(DART_LIST_URL, params=params, timeout=15, headers=UA_HEADERS)
+            r.raise_for_status()
+            data = r.json()
 
-        # 너무 길어지면 합치되 일부만
-        return "\n".join(texts)[:2_000_000]  # 2MB 가드
-    except Exception:
-        return ""
+            # 000: 정상, 013: 데이터 없음 등
+            if data.get("status") != "000":
+                break
 
-def market_cls_from_report(item) -> str:
-    v = (item.get("corp_cls") or "").strip().upper()
-    return v
+            items = data.get("list", []) or []
+            for it in items:
+                rcp_no = _norm(it.get("rcp_no", ""))
+                if rcp_no:
+                    all_items[rcp_no] = it
 
-def should_consider(item) -> bool:
-    """
-    1차 제목 기반 필터: 증자 관련 문서만
-    """
-    report_nm = (item.get("report_nm") or "").strip()
-    if not report_nm:
-        return False
+            total_page = int(data.get("total_page", "1") or "1")
+            if page_no >= total_page:
+                break
+            page_no += 1
 
-    # 제목에 유/무상 단어가 없으면 제외
-    if not INC_TITLE.search(report_nm):
-        return False
+    def sort_key(x: dict):
+        return (_norm(x.get("rcept_dt", "")), _norm(x.get("rcp_no", "")))
 
-    # 넓게 통과
-    if not INC_REPORT.search(report_nm):
-        return True
-    return True
+    return sorted(all_items.values(), key=sort_key, reverse=True)
 
-def is_third_party_strict(rcp_no: str, report_nm: str, html_text: str) -> bool:
-    """
-    ✅ 제3자배정 '절대 제외' 정책:
-    - 1) 제목에 제3자배정 변형이 있으면 즉시 제외
-    - 2) main.do HTML에 있으면 제외
-    - 3) document.xml 원문에 있으면 제외 (가장 강력)
-    - 4) 둘 다 못가져오면(=확정 불가) 안전하게 제외
-    """
-    # 1) 제목(가장 빠른 컷)
-    if THIRD_PARTY.search(report_nm or ""):
-        return True
 
-    # 2) HTML(보조)
-    if html_text and THIRD_PARTY.search(html_text):
-        return True
-
-    # 3) 원문(document.xml)로 확정
-    doc_text = get_document_text(rcp_no)
-    if doc_text:
-        if THIRD_PARTY.search(doc_text):
-            return True
-        return False
-
-    # 4) 원문도 못받았으면 '절대 제외' 정책상 제외
-    return True
-
-def is_in_scope(report_nm: str, doc_or_html_text: str) -> bool:
-    """
-    - 무상증자: 제3자배정만 아니면 통과
-    - 유상증자: 제3자배정 제외, 그 외는 통과(누락 방지)
-      * "일반/주주배정만"으로 더 강하게 제한하려면 마지막 return True를 False로 바꾸면 됨.
-    """
-    if not doc_or_html_text:
-        return False
-
-    if re.search(r"무상증자", report_nm or "", re.I):
-        return True
-
-    if INCLUDE_HINT.search(doc_or_html_text):
-        return True
-
-    # 힌트가 없어도(문서 구조/표현 차이) 제3자만 아니면 일단 통과
-    return True
-
-def fmt_date_yyyymmdd_to_iso(s: str) -> str:
-    if not s or len(s) != 8:
-        return s
-    return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
-
-def main_once():
+# =========================
+# Main
+# =========================
+def validate_env() -> None:
     if not DART_API_KEY:
-        raise RuntimeError("DART_API_KEY is missing")
+        raise RuntimeError("Missing DART_API_KEY env")
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        raise RuntimeError("TG_BOT_TOKEN or TG_CHAT_ID is missing")
+        raise RuntimeError("Missing TG_BOT_TOKEN or TG_CHAT_ID env")
 
-    st = load_state()
-    seen = set(st.get("seen", []))
 
-    end_dt = datetime.now()
-    start_dt = end_dt - timedelta(days=LOOKBACK_DAYS)
-    bgn_de = start_dt.strftime("%Y%m%d")
-    end_de = end_dt.strftime("%Y%m%d")
+def run_once() -> int:
+    validate_env()
 
-    new_hits = []
+    state = load_state(STATE_PATH)
+    items = fetch_items_window(LOOKBACK_DAYS)
 
-    page_no = 1
-    total_pages = 1
+    scanned = 0
+    sent = 0
 
-    while page_no <= total_pages:
-        data = dart_list(bgn_de, end_de, page_no)
+    for item in items:
+        scanned += 1
+        report_nm = _norm(item.get("report_nm", ""))
+        rcp_no = _norm(item.get("rcp_no", ""))
+        if not rcp_no:
+            continue
 
-        if str(data.get("status")) != "000":
-            raise RuntimeError(f"DART list error: {data.get('status')} / {data.get('message')}")
+        if already_seen(state, rcp_no):
+            continue
 
-        total_count = int(data.get("total_count") or 0)
-        page_count = int(data.get("page_count") or 100)
-        total_pages = (total_count + page_count - 1) // page_count if total_count > 0 else 1
+        # ✅ 핵심: 유상증자 + 제3자배정 제외
+        if not is_allowed_rights_issue(report_nm, rcp_no):
+            # 재검사 방지 위해 skipped도 seen 처리
+            mark_seen(state, rcp_no, {"skipped": True, "report_nm": report_nm, "ts": int(time.time())})
+            continue
 
-        for item in data.get("list", []) or []:
-            rcp_no = (item.get("rcept_no") or "").strip()
-            if not rcp_no or rcp_no in seen:
-                continue
-
-            corp_cls = market_cls_from_report(item)
-            if MARKET_CLASSES and corp_cls and (corp_cls not in MARKET_CLASSES):
-                continue
-
-            if not should_consider(item):
-                continue
-
-            report_nm = (item.get("report_nm") or "").strip()
-            corp_name = (item.get("corp_name") or "").strip()
-            rcept_dt  = fmt_date_yyyymmdd_to_iso((item.get("rcept_dt") or "").strip())
-
-            view_url = DART_VIEW_URL.format(rcpNo=rcp_no)
-
-            # 보조 HTML
-            html_text = get_view_html(rcp_no)
-
-            # ✅ 제3자배정 "절대 제외" (제목/HTML/원문 zip)
-            if is_third_party_strict(rcp_no, report_nm, html_text):
-                seen.add(rcp_no)
-                continue
-
-            # 범위 판단은 원문 텍스트가 더 정확하니, document.xml 텍스트 우선 사용
-            doc_text = get_document_text(rcp_no)
-            scope_text = doc_text if doc_text else html_text
-
-            if not is_in_scope(report_nm, scope_text):
-                seen.add(rcp_no)
-                continue
-
-            new_hits.append({
-                "rcept_no": rcp_no,
-                "corp_name": corp_name,
-                "corp_cls": corp_cls,
-                "rcept_dt": rcept_dt,
-                "report_nm": report_nm,
-                "view_url": view_url
-            })
-
-            seen.add(rcp_no)
-
-        page_no += 1
-
-    new_hits.sort(key=lambda x: (x.get("rcept_dt", ""), x.get("rcept_no", "")))
-
-    for h in new_hits:
-        corp_cls = h["corp_cls"] or ""
-        suffix = f" ({corp_cls})" if corp_cls else ""
-        title = "📌 증자 공시 감지"
-        body = [
-            f"• 회사: {h['corp_name']}{suffix}",
-            f"• 접수일: {h['rcept_dt']}",
-            "",
-            "공시",
-            f"– {h['report_nm']}",
-            f"({h['rcept_no']})"
-        ]
+        dart_url = DART_VIEW_URL.format(rcpNo=rcp_no)
         try:
-            tg_send_card(title, body, h["view_url"])
+            tg_send(fmt_msg(item), dart_url)
+            sent += 1
+            mark_seen(state, rcp_no, {"sent": True, "report_nm": report_nm, "ts": int(time.time())})
+            save_state(STATE_PATH, state)
         except Exception as e:
-            print(f"[TG ERROR] {h['rcept_no']} {e}")
+            print(f"[ERROR] telegram send failed rcp_no={rcp_no}: {e}")
+            # 전송 실패면 seen 처리 안 해서 다음에 재시도 가능
 
-    st["seen"] = list(seen)[-5000:]
-    save_state(st)
+    save_state(STATE_PATH, state)
+    print(f"[OK] scanned={scanned} unique={len(items)} sent={sent}")
+    return sent
 
-    print(f"OK sent={len(new_hits)} seen={len(st['seen'])}")
 
 def main():
-    main_once()
+    if POLL_SLEEP_SEC <= 0:
+        run_once()
+        return
 
-    if POLL_SLEEP_SEC > 0:
-        while True:
-            time.sleep(POLL_SLEEP_SEC)
-            try:
-                main_once()
-            except Exception as e:
-                print(f"[LOOP ERROR] {e}")
+    while True:
+        try:
+            run_once()
+        except Exception as e:
+            print(f"[ERROR] run_once: {e}")
+        time.sleep(POLL_SLEEP_SEC)
+
 
 if __name__ == "__main__":
     main()
