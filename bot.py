@@ -34,9 +34,9 @@ import requests
 # =========================
 # ENV
 # =========================
-DART_API_KEY = os.getenv("DART_API_KEY", "").strip()
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
-TG_CHAT_ID   = os.getenv("TG_CHAT_ID", "").strip()
+DART_API_KEY = os.getenv("4e34368459edf9be284521643b0b623f94684efe", "").strip()
+TG_BOT_TOKEN = os.getenv("8337357668:AAHy1zroWzyuBzm95FNOWq_pXcaPb0sepv8", "").strip()
+TG_CHAT_ID   = os.getenv("8398762332", "").strip()
 
 LOOKBACK_DAYS  = int(os.getenv("LOOKBACK_DAYS", "3"))
 MARKET_CLASSES = [x.strip().upper() for x in os.getenv("MARKET_CLASSES", "Y,K,N").split(",") if x.strip()]
