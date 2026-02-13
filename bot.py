@@ -1,21 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-DART 증자 공시 텔레그램 알림 (완성형 통합본)
-- 유상/무상 증자 공시 감지
-- ✅ 제3자배정(제3자배정증자 포함) "절대" 제외 (제목/HTML/원문 document.xml zip 다 검사)
-- 텔레그램 카드 + "📄 DART 열기" 버튼 유지
-- GitHub Actions(1회 실행) / VPS 상시루프(POLL_SLEEP_SEC>0) 둘 다 지원
-"""
-
 import os
 import json
 import time
 import re
 import html
-import io
-import zipfile
 import requests
 from datetime import datetime, timedelta
 
@@ -23,52 +13,36 @@ from datetime import datetime, timedelta
 # ENV
 # =========================
 DART_API_KEY = os.getenv("4e34368459edf9be284521643b0b623f94684efe", "").strip()
-TG_BOT_TOKEN = os.getenv("8337357668:AAHDQJcYB3VWvo15uP6Q9uZSLn40Q2MCjE", "").strip()
+TG_BOT_TOKEN = os.getenv("8337357668:AAHDQJcYB3VWvo15uP6Q9uZSLn40Q2MCjE​", "").strip()
 TG_CHAT_ID   = os.getenv("8398762332", "").strip()
 
 LOOKBACK_DAYS   = int(os.getenv("LOOKBACK_DAYS", "3"))
 MARKET_CLASSES  = [x.strip().upper() for x in os.getenv("MARKET_CLASSES", "Y,K,N").split(",") if x.strip()]
 POLL_SLEEP_SEC  = int(os.getenv("POLL_SLEEP_SEC", "0"))  # GitHub Actions는 0 권장(한번만 실행)
 
-# ✅ 원문(document.xml) 읽기 실패 시 정책
-# - "strict": 원문 못 읽으면 안전하게 제외(=알림 안 보냄)  -> 제3자배정 절대 새지 않음
-# - "lenient": 원문 못 읽으면 HTML/제목만으로 판단 후 통과 가능 -> 누락은 줄지만, 제3자배정이 새는 위험 존재
-DOC_FAIL_POLICY = os.getenv("DOC_FAIL_POLICY", "strict").strip().lower()
-
 STATE_PATH = "state.json"
 
 DART_LIST_URL = "https://opendart.fss.or.kr/api/list.json"
-DART_DOC_URL  = "https://opendart.fss.or.kr/api/document.xml"  # zip 반환
 DART_VIEW_URL = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcpNo}"
 
 TG_SEND_URL = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
 
 S = requests.Session()
-S.headers.update({"User-Agent": "dart-alert/ops/2.0"})
+S.headers.update({"User-Agent": "dart-alert/ops/1.0"})
 
 # =========================
 # Regex / Keywords
 # =========================
 # 기본: 증자 관련
 INC_TITLE = re.compile(r"(유상증자|무상증자)", re.I)
-
 # 유상/무상 결정/정정류 (넓게)
-INC_REPORT = re.compile(
-    r"(유상증자결정|무상증자결정|주요사항보고서\(유상증자결정\)|주요사항보고서\(무상증자결정\)|정정.*유상증자|정정.*무상증자|유상증자또는주식관련사채등의발행결과)",
-    re.I
-)
+INC_REPORT = re.compile(r"(유상증자결정|무상증자결정|주요사항보고서\(유상증자결정\)|주요사항보고서\(무상증자결정\)|정정.*유상증자|정정.*무상증자)", re.I)
 
-# ✅ 제3자배정 제외(강화: 제삼자/띄어쓰기/영문/증자 단어 포함 변형까지)
-THIRD_PARTY = re.compile(
-    r"(제\s*[삼3]\s*자\s*배정(\s*증자)?|제\s*[삼3]\s*자\s*배정\s*유상증자|third\s*party|3rd\s*party)",
-    re.I
-)
+# 제3자배정 제외(본문에서 확정)
+THIRD_PARTY = re.compile(r"(제\s*3\s*자\s*배정|제3자배정)", re.I)
 
-# 포함하고 싶은 “일반/주주배정” 힌트(문서에서 가점)
+# 포함하고 싶은 “일반/주주배정” 힌트(본문에서 가점)
 INCLUDE_HINT = re.compile(r"(일반공모|일반\s*주주|주주배정|구주주|기존주주)", re.I)
-
-# HTML/XML 태그 제거용(대충 텍스트화)
-TAG_RE = re.compile(r"<[^>]+>")
 
 # =========================
 # Helpers
@@ -122,83 +96,27 @@ def dart_list(start_date: str, end_date: str, page_no: int):
         "page_no": page_no,
         "page_count": 100,
     }
+    # market classes filter: corp_cls can be only one in API; 그래서 여러개면 반복 호출보다
+    # 여기서는 전체 받아서 후필터(안정성 위해).
     r = S.get(DART_LIST_URL, params=params, timeout=20)
     r.raise_for_status()
     return r.json()
 
 def get_view_html(rcp_no: str) -> str:
-    """
-    DART 뷰어(main.do) HTML
-    - 텍스트가 스크립트로 로딩되는 경우가 많아 '보조' 자료로만 사용
-    """
     url = DART_VIEW_URL.format(rcpNo=rcp_no)
     r = S.get(url, timeout=25)
+    # 200이 아니어도 필터링이 중요하니 예외 대신 빈 문자열 처리
     if not r.ok:
         return ""
     return r.text
 
-def _decode_best_effort(raw: bytes) -> str:
-    if not raw:
-        return ""
-    # utf-8 우선, 실패하면 euc-kr/latin-1 순으로 시도
-    for enc in ("utf-8", "euc-kr", "cp949", "latin-1"):
-        try:
-            s = raw.decode(enc, errors="ignore")
-            if s and s.strip():
-                return s
-        except Exception:
-            continue
-    return raw.decode("utf-8", errors="ignore")
-
-def get_document_text(rcp_no: str) -> str:
-    """
-    ✅ OpenDART document.xml (zip)에서 원문 텍스트 추출
-    - 실패하면 "" 반환
-    """
-    try:
-        params = {"crtfc_key": DART_API_KEY, "rcept_no": rcp_no}
-        r = S.get(DART_DOC_URL, params=params, timeout=25)
-        if not r.ok or not r.content:
-            return ""
-
-        content = r.content
-
-        # zip이면 PK로 시작
-        if content.startswith(b"PK"):
-            zf = zipfile.ZipFile(io.BytesIO(content))
-            texts = []
-            for name in zf.namelist():
-                ln = name.lower()
-                if not (ln.endswith(".xml") or ln.endswith(".html") or ln.endswith(".htm")):
-                    continue
-                try:
-                    raw = zf.read(name)
-                except Exception:
-                    continue
-
-                s = _decode_best_effort(raw)
-                if not s.strip():
-                    continue
-
-                # 태그 제거 + HTML 엔티티 해제
-                s = TAG_RE.sub(" ", s)
-                s = html.unescape(s)
-                texts.append(s)
-
-            # 너무 길어지면 가드
-            return "\n".join(texts)[:2_000_000]
-
-        # zip이 아니면 그냥 텍스트/XML일 수 있음
-        return _decode_best_effort(content)
-
-    except Exception:
-        return ""
-
 def market_cls_from_report(item) -> str:
     """
     list.json에는 corp_cls가 있을 때도 있고 없을 때도 있음(상황에 따라).
+    있으면 사용하고, 없으면 빈값.
     """
-    return (item.get("corp_cls") or "").strip().upper()
+    v = (item.get("corp_cls") or "").strip().upper()
+    return v
 
 def should_consider(item) -> bool:
     """
@@ -207,62 +125,44 @@ def should_consider(item) -> bool:
     report_nm = (item.get("report_nm") or "").strip()
     if not report_nm:
         return False
-
     if not INC_TITLE.search(report_nm):
         return False
-
-    # 너무 빡빡하면 누락될 수 있어 넓게 통과
     if not INC_REPORT.search(report_nm):
+        # 너무 빡빡하면 누락될 수 있어 넓게 통과시키고 후단 HTML에서 판단 가능
         return True
-
     return True
 
-def is_third_party_strict(rcp_no: str, report_nm: str, html_text: str, doc_text: str) -> bool:
-    """
-    ✅ 제3자배정 '절대 제외' 정책:
-    - 1) 제목에 제3자배정 변형이 있으면 즉시 제외
-    - 2) 원문(document.xml)에서 발견되면 제외 (가장 확실)
-    - 3) HTML(보조)에서 발견되면 제외
-    - 4) 원문을 못 읽으면 정책(DOC_FAIL_POLICY)에 따라:
-       - strict: 안전하게 제외(알림 안 보냄)
-       - lenient: 제목/HTML만으로 판단
-    """
-    # 1) 제목
-    if THIRD_PARTY.search(report_nm or ""):
+def is_third_party_by_html(html_text: str) -> bool:
+    if not html_text:
+        # HTML을 못가져오면 “안전하게” 제외할지/포함할지 선택 필요.
+        # 너 요구는 "제3자배정은 절대 안 나오게" -> HTML 실패 시 보수적으로 제외.
         return True
+    return bool(THIRD_PARTY.search(html_text))
 
-    # 2) 원문
-    if doc_text:
-        if THIRD_PARTY.search(doc_text):
-            return True
+def is_in_scope_by_html(html_text: str, report_nm: str) -> bool:
+    """
+    - 무상증자: 보통 제3자배정 이슈 없음 -> HTML 제3자만 아니면 통과
+    - 유상증자: 제3자배정 제외, 그리고 일반/주주배정 힌트가 없으면 애매하지만
+      제목이 유상증자결정이면 통과시키되, 제3자만 확실히 제외.
+    """
+    if not html_text:
         return False
 
-    # 3) 원문이 없으면 HTML 보조 검사
-    if html_text and THIRD_PARTY.search(html_text):
-        return True
-
-    # 4) 최종 정책
-    if DOC_FAIL_POLICY == "strict":
-        return True
-
-    return False
-
-def is_in_scope(report_nm: str, scope_text: str) -> bool:
-    """
-    - 무상증자: 제3자배정만 아니면 통과
-    - 유상증자: 제3자배정 제외, 그 외는 통과(누락 방지)
-      * "일반/주주배정만"으로 더 강하게 제한하고 싶으면 마지막 return True를 False로 바꾸면 됨.
-    """
-    if not scope_text:
+    # 제3자배정이면 무조건 제외
+    if THIRD_PARTY.search(html_text):
         return False
 
-    if re.search(r"무상증자", report_nm or "", re.I):
+    # 무상은 통과
+    if re.search(r"무상증자", report_nm, re.I):
         return True
 
-    if INCLUDE_HINT.search(scope_text):
+    # 유상은: “일반/주주배정” 힌트가 있으면 확실히 통과
+    if INCLUDE_HINT.search(html_text):
         return True
 
-    # 힌트가 없어도(표/문서 구조 차이) 제3자만 아니면 일단 통과
+    # 힌트가 없어도, 제3자만 아니면 일단 통과(너가 일반/주주배정만 원하지만
+    # 문서 구조상 힌트가 누락되는 경우가 있어 누락 방지용)
+    # 더 강하게 제한하고 싶으면 아래 줄을 False로 바꾸면 됨.
     return True
 
 def fmt_date_yyyymmdd_to_iso(s: str) -> str:
@@ -294,6 +194,7 @@ def main_once():
         data = dart_list(bgn_de, end_de, page_no)
 
         if str(data.get("status")) != "000":
+            # DART 오류면 바로 중단(재시도는 Actions가 해줌)
             raise RuntimeError(f"DART list error: {data.get('status')} / {data.get('message')}")
 
         total_count = int(data.get("total_count") or 0)
@@ -319,21 +220,16 @@ def main_once():
 
             view_url = DART_VIEW_URL.format(rcpNo=rcp_no)
 
-            # 보조 HTML
+            # HTML로 제3자배정 확정 필터
             html_text = get_view_html(rcp_no)
 
-            # ✅ 원문 텍스트(가장 확실)
-            doc_text = get_document_text(rcp_no)
-
-            # ✅ 제3자배정 "절대 제외"
-            if is_third_party_strict(rcp_no, report_nm, html_text, doc_text):
+            # HTML을 못받으면 “제3자배정 절대 제외” 정책상 제외
+            if is_third_party_by_html(html_text):
                 seen.add(rcp_no)
                 continue
 
-            # 범위 판단은 원문 텍스트 우선
-            scope_text = doc_text if doc_text else html_text
-
-            if not is_in_scope(report_nm, scope_text):
+            # 범위(일반/주주배정 + 무상/유상) 통과 판단
+            if not is_in_scope_by_html(html_text, report_nm):
                 seen.add(rcp_no)
                 continue
 
@@ -351,7 +247,7 @@ def main_once():
         page_no += 1
 
     # 최신순 정렬(받는쪽 보기 좋게)
-    new_hits.sort(key=lambda x: (x.get("rcept_dt", ""), x.get("rcept_no", "")))
+    new_hits.sort(key=lambda x: (x.get("rcept_dt",""), x.get("rcept_no","")))
 
     # 전송
     for h in new_hits:
@@ -370,6 +266,7 @@ def main_once():
             tg_send_card(title, body, h["view_url"])
         except Exception as e:
             # 텔레그램 전송 실패해도 state는 저장해야 중복폭탄 방지
+            # 에러는 콘솔에 남김(GitHub Actions 로그)
             print(f"[TG ERROR] {h['rcept_no']} {e}")
 
     # state 저장
